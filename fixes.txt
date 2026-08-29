@@ -1,0 +1,285 @@
+/* MacroForge FINAL repair layer v6
+   Deterministic food selection/logging, global search, custom foods, settings and sign-out.
+*/
+(function(){
+  "use strict";
+
+  const SEARCH={timer:null,controller:null,request:0};
+  const OFF_FIELDS=["code","product_name","product_name_en","generic_name","generic_name_en","brands","lang","languages_tags","quantity","serving_size","nutriments","image_front_small_url"].join(",");
+  const esc=v=>String(v??"").replace(/[&<>\"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
+  const norm=v=>String(v||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9\u0600-\u06ff]+/g," ").trim();
+  const toks=v=>norm(v).split(/\s+/).filter(Boolean);
+
+  function coreFood(){return window.MacroForgeFinal?.selectedFood||window.selectedFood||null;}
+  function setCoreFood(food){
+    if(window.MacroForgeFinal) window.MacroForgeFinal.selectedFood=food;
+    window.selectedFood=food;
+    return food;
+  }
+
+  function nutrition(p){
+    const n=p?.nutriments||{};
+    let cal=Number(n["energy-kcal_100g"]??n["energy-kcal"]??0);
+    if(!Number.isFinite(cal)||cal<0){const kj=Number(n["energy_100g"]??0);cal=kj>0?kj/4.184:0;}
+    return {
+      cal:Math.max(0,cal),
+      p:Math.max(0,Number(n["proteins_100g"]??n["proteins"]??0)),
+      c:Math.max(0,Number(n["carbohydrates_100g"]??n["carbohydrates"]??0)),
+      f:Math.max(0,Number(n["fat_100g"]??n["fat"]??0)),
+      fiber:Math.max(0,Number(n["fiber_100g"]??n["fiber"]??0)),
+      sugar:Math.max(0,Number(n["sugars_100g"]??0)),
+      sodium:Math.max(0,Number(n["sodium_100g"]??0))
+    };
+  }
+
+  function nameOf(p,q){
+    const candidates=[p.product_name_en,p.product_name,p.generic_name_en,p.generic_name].filter(Boolean).map(String);
+    const qn=norm(q);
+    return candidates.find(x=>norm(x)===qn)||candidates.find(x=>norm(x).includes(qn))||candidates.find(x=>toks(q).every(t=>norm(x).includes(t)))||candidates[0]||q;
+  }
+  function score(p,q){
+    const qn=norm(q), ts=toks(q);
+    const names=[p.product_name_en,p.product_name,p.generic_name_en,p.generic_name].filter(Boolean).map(norm);
+    const brands=String(p.brands||"").split(",").map(norm).filter(Boolean);
+    const all=[...names,...brands].join(" ");
+    if(!ts.every(t=>all.includes(t))) return -1;
+    const a=names[0]||"", b=names[1]||"", brand=brands.join(" ");
+    let s=0;
+    if(a===qn||b===qn)s+=10000;
+    if(a.startsWith(qn)||b.startsWith(qn))s+=4000;
+    if(a.includes(qn)||b.includes(qn))s+=2000;
+    if(brand===qn)s+=800;
+    if(brand.includes(qn))s+=300;
+    s+=ts.filter(t=>a.includes(t)||b.includes(t)).length*300;
+    const n=nutrition(p); if(n.cal||n.p||n.c||n.f)s+=500;
+    return s;
+  }
+  function extract(d){
+    if(Array.isArray(d?.products))return d.products;
+    if(Array.isArray(d?.hits))return d.hits.map(x=>x?._source||x).filter(Boolean);
+    return [];
+  }
+
+  function makeFood(p,q,s){
+    const n=nameOf(p,q),nu=nutrition(p);
+    return {
+      id:p.code?`global_${p.code}`:`global_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      name:n,roman:p.brands?`Brand: ${p.brands}`:"Global food",category:"Global",
+      cal:nu.cal,p:nu.p,c:nu.c,f:nu.f,fiber:nu.fiber,sugar:nu.sugar,sodium:nu.sodium,
+      baseUnit:"g",nutritionUnit:"g",nutritionAmount:100,portionGrams:1,defaultUnit:"g",
+      quantity:p.quantity||p.serving_size||"Per 100 g",source:"Open Food Facts",barcode:p.code||"",image:p.image_front_small_url||"",score:s
+    };
+  }
+
+  async function fetchJSON(url,options={}){
+    const r=await fetch(url,{mode:"cors",cache:"no-store",...options});
+    if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async function globalSearch(query){
+    const q=String(query||"").trim();
+    if(q.length<2)return;
+    const box=document.getElementById("foodResults"); if(!box)return;
+    SEARCH.request++; const req=SEARCH.request;
+    if(SEARCH.timer)clearTimeout(SEARCH.timer);
+    if(SEARCH.controller)SEARCH.controller.abort();
+    SEARCH.controller=new AbortController();
+    const signal=SEARCH.controller.signal;
+    box.querySelectorAll(".mf-global-heading,.mf-global-result,.mf-global-error").forEach(e=>e.remove());
+    const loading=document.createElement("div"); loading.className="mf-global-heading"; loading.style.cssText="grid-column:1/-1"; loading.innerHTML='<span class="pill">SEARCHING GLOBAL DATABASE…</span>'; box.prepend(loading);
+
+    let products=[]; let lastErr=null;
+    const urls=[
+      {url:"https://search.openfoodfacts.org/search",type:"searchalicious"},
+      {url:"https://world.openfoodfacts.org/cgi/search.pl",type:"legacy"}
+    ];
+
+    for(const target of urls){
+      try{
+        let data;
+        if(target.type==="searchalicious"){
+          const params=new URLSearchParams({q,langs:"en",page:"1",page_size:"50",boost_phrase:"true"});
+          data=await fetchJSON(`${target.url}?${params.toString()}`,{signal});
+        }else{
+          const params=new URLSearchParams({action:"process",json:"1",search_simple:"1",search_terms:q,page:"1",page_size:"50",lc:"en",fields:OFF_FIELDS});
+          data=await fetchJSON(`${target.url}?${params.toString()}`,{signal});
+        }
+        products=extract(data);
+        if(products.length)break;
+      }catch(e){lastErr=e;if(e.name==="AbortError")return;}
+    }
+
+    if(req!==SEARCH.request)return;
+    loading.remove();
+    const ranked=products.map(p=>({p,s:score(p,q)})).filter(x=>x.s>=500).sort((a,b)=>b.s-a.s);
+    const seen=new Set(),foods=[];
+    for(const x of ranked){
+      const f=makeFood(x.p,q,x.s),key=(f.barcode||"")+"|"+norm(f.name);
+      if(seen.has(key))continue; seen.add(key); foods.push(f); if(foods.length>=24)break;
+    }
+    if(!foods.length){
+      const e=document.createElement("div"); e.className="empty-state mf-global-result mf-global-error"; e.style.gridColumn="1/-1";
+      e.innerHTML=lastErr?`<h3>Global search is temporarily unavailable</h3><p>The global food service did not return usable data. Try again in a moment, or use Local Foods / Custom Food.</p><button class="secondary-btn" id="mfRetry">Retry</button>`:`<h3>No reliable global match</h3><p>Try the exact product or brand name.</p>`;
+      box.prepend(e); e.querySelector("#mfRetry")?.addEventListener("click",()=>globalSearch(q)); return;
+    }
+    const heading=document.createElement("div"); heading.className="mf-global-heading"; heading.style.cssText="grid-column:1/-1"; heading.innerHTML=`<span class="pill">GLOBAL RESULTS · ${foods.length}</span>`; box.prepend(heading);
+    foods.forEach(f=>{
+      const card=document.createElement("article"); card.className="food-card mf-global-result";
+      card.innerHTML=`<span class="category">GLOBAL DATABASE</span><h3>${esc(f.name)}</h3><div class="roman">${esc(f.roman)}</div><div class="macro-line"><span>CAL<b>${Math.round(f.cal)} kcal</b></span><span>PROT<b>${f.p.toFixed(1)}g</b></span><span>CARB<b>${f.c.toFixed(1)}g</b></span><span>FAT<b>${f.f.toFixed(1)}g</b></span></div><small class="muted">${esc(f.quantity)}</small><button class="primary full">View nutrition & log</button>`;
+      card.querySelector("button").onclick=()=>{setCoreFood(f);window.openFood?.(f);};
+      box.appendChild(card);
+    });
+  }
+
+  function installSearch(){
+    const input=document.getElementById("foodSearch"),btn=document.getElementById("searchFoodBtn"); if(!input)return;
+    input.oninput=()=>{clearTimeout(SEARCH.timer);window.renderFoods?.();const q=input.value.trim();if(q.length<2)return;SEARCH.timer=setTimeout(()=>globalSearch(q),700);};
+    input.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();clearTimeout(SEARCH.timer);globalSearch(input.value.trim());}};
+    if(btn)btn.onclick=()=>globalSearch(input.value.trim());
+  }
+
+  const WEIGHTS={g:1,ml:1,piece:50,slice:30,scoop:30,serving:100,plate:300,bowl:250,cup:240,glass:300,wrap:180,tbsp:15,tsp:5,packet:50,bottle:500};
+  function servingFromText(text){
+    const t=String(text||"").toLowerCase();
+    const m=t.match(/(?:^|\s)(\d+(?:\.\d+)?)\s*(kg|g|mg|l|ml|cl|oz|lb|fl\s*oz)\b/);
+    if(!m)return null;
+    let value=Number(m[1]), unit=m[2].replace(/\s+/g,"");
+    if(unit==="kg")return {size:value*1000,basis:"g",label:`${value} kg`};
+    if(unit==="mg")return {size:value/1000,basis:"g",label:`${value} mg`};
+    if(unit==="oz")return {size:value*28.3495,basis:"g",label:`${value} oz`};
+    if(unit==="lb")return {size:value*453.592,basis:"g",label:`${value} lb`};
+    if(unit==="l")return {size:value*1000,basis:"ml",label:`${value} L`};
+    if(unit==="cl")return {size:value*10,basis:"ml",label:`${value} cl`};
+    if(unit==="fl oz")return {size:value*29.5735,basis:"ml",label:`${value} fl oz`};
+    return {size:value,basis:unit==="ml"?"ml":"g",label:`${value} ${unit}`};
+  }
+
+  function fillCustomFromGlobal(food){
+    const n=food;
+    const serving=servingFromText(n.quantity)||servingFromText(n.serving_size);
+    const basis=serving?.basis||"g";
+    const size=serving?.size||100;
+    const name=document.getElementById("customName");
+    const cb=document.getElementById("customBasis");
+    const cu=document.getElementById("customUnit");
+    const cs=document.getElementById("customServingSize");
+    const vals={customCal:n.cal,customProtein:n.p,customCarbs:n.c,customFat:n.f,customFiber:n.fiber};
+    if(name)name.value=n.name||"";
+    if(cb)cb.value=basis;
+    if(cs)cs.value=size;
+    if(cu){
+      if(basis==="g")cu.value="g";
+      else if(basis==="ml")cu.value="ml";
+      else cu.value="serving";
+    }
+    Object.entries(vals).forEach(([id,v])=>{const e=document.getElementById(id);if(e)e.value=Number(v||0).toFixed(2)});
+    const box=document.getElementById("customGlobalResults");
+    if(box)box.innerHTML=`<div class="lookup-selected"><b>Filled from ${esc(n.name)}</b><small>${serving?`Serving reference: ${esc(serving.label)}`:"No serving weight was supplied; using 100 g."} · ${Math.round(n.cal)} kcal · P ${n.p.toFixed(1)}g · C ${n.c.toFixed(1)}g · F ${n.f.toFixed(1)}g</small></div>`;
+    window.toast?.("Custom food fields filled from global data");
+  }
+
+  function installCustomGlobalLookup(){
+    const input=document.getElementById("customGlobalSearch"), btn=document.getElementById("customGlobalSearchBtn"), box=document.getElementById("customGlobalResults");
+    if(!input||!btn||!box)return;
+    const run=async()=>{
+      const q=input.value.trim(); if(q.length<2){box.innerHTML="<div class='muted'>Type at least 2 characters.</div>";return;}
+      box.innerHTML="<div class='muted'>Searching global food database…</div>";
+      try{
+        const urls=[
+          `https://search.openfoodfacts.org/search?q=${encodeURIComponent(q)}&langs=en&page=1&page_size=12`,
+          `https://world.openfoodfacts.org/cgi/search.pl?action=process&json=1&search_simple=1&search_terms=${encodeURIComponent(q)}&page=1&page_size=12&lc=en&fields=${OFF_FIELDS}`
+        ];
+        let products=[];
+        for(const url of urls){try{const d=await fetchJSON(url);products=extract(d);if(products.length)break}catch(e){}}
+        const foods=products.map(p=>({p,s:score(p,q)})).filter(x=>x.s>=500).sort((a,b)=>b.s-a.s).slice(0,8).map(x=>makeFood(x.p,q,x.s));
+        if(!foods.length){box.innerHTML="<div class='muted'>No reliable global match. Try a product or brand name.</div>";return;}
+        box.innerHTML=foods.map((f,i)=>`<button type="button" class="lookup-result" data-i="${i}"><b>${esc(f.name)}</b><small>${esc(f.quantity)} · ${Math.round(f.cal)} kcal · P ${f.p.toFixed(1)}g · C ${f.c.toFixed(1)}g · F ${f.f.toFixed(1)}g</small></button>`).join("");
+        box.querySelectorAll("[data-i]").forEach(b=>b.onclick=()=>fillCustomFromGlobal(foods[Number(b.dataset.i)]));
+      }catch(e){box.innerHTML="<div class='muted'>Global lookup unavailable right now. You can still enter the nutrition manually.</div>";}
+    };
+    btn.onclick=run; input.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();run()}};
+  }
+
+  function customCreate(){
+    const name=document.getElementById("customName")?.value.trim();
+    const basis=document.getElementById("customBasis")?.value||"g";
+    const servingUnit=document.getElementById("customUnit")?.value||"serving";
+    const servingSize=Number(document.getElementById("customServingSize")?.value)||0;
+    const cal=Number(document.getElementById("customCal")?.value)||0,p=Number(document.getElementById("customProtein")?.value)||0,c=Number(document.getElementById("customCarbs")?.value)||0,f=Number(document.getElementById("customFat")?.value)||0,fiber=Number(document.getElementById("customFiber")?.value)||0;
+    if(!name)return window.toast?.("Enter a food name");
+    if(!servingSize||servingSize<=0)return window.toast?.("Enter the serving size");
+    if([cal,p,c,f,fiber].some(x=>x<0))return window.toast?.("Nutrition cannot be negative");
+    const physical=basis==="g"?servingSize:servingSize;
+    const food={id:"custom_"+Date.now(),name,roman:name,category:"Custom",cal,p,c,f,fiber,baseUnit:basis,nutritionUnit:basis,nutritionAmount:100,portionGrams:basis==="g"?physical:(WEIGHTS[servingUnit]||100),portionMl:basis==="ml"?physical:null,defaultUnit:servingUnit,unitWeights:{...WEIGHTS},servingSize,servingUnit,source:"User-created custom food"};
+    window.state.customFoods=Array.isArray(window.state.customFoods)?window.state.customFoods:[];
+    const addToLibrary=window.confirm(`Add “${name}” to your MacroForge food library for future use?\n\nOK = Add to food library\nCancel = Log it only / keep it in recent logs`);
+    if(addToLibrary)window.state.customFoods.push(food);
+    window.state.recentFoods=Array.isArray(window.state.recentFoods)?window.state.recentFoods:[];
+    window.state.recentFoods=[food,...window.state.recentFoods.filter(x=>x.name!==food.name)].slice(0,30);
+    window.save?.(); window.modal?.("customModal",false); setCoreFood(food); window.openFood?.(food); window.renderFoods?.(); window.toast?.(addToLibrary?`${name} added to library and ready to log`:`${name} kept in recent foods and ready to log`);
+  }
+  function calculate(food,amount,unit){
+    if(typeof window.mfCalculatePortion==="function")return window.mfCalculatePortion(food,amount,unit);
+    if(window.MacroForgeFinal?.calculate)return window.MacroForgeFinal.calculate(food,amount,unit);
+    const a=Number(amount)||0, basis=food.nutritionUnit||food.baseUnit||"g", base=Number(food.nutritionAmount)||100;
+    const weights=WEIGHTS;
+    let physical=basis==="g"?(unit==="g"?a:(food.unitWeights?.[unit]||weights[unit]||100)*a):(unit==="ml"?a:(food.unitVolumes?.[unit]||weights[unit]||100)*a);
+    const mult=physical/base, val=k=>Math.max(0,Number(food[k])||0)*mult;
+    return {cal:val("cal"),p:val("p"),c:val("c"),f:val("f"),fiber:val("fiber"),sugar:val("sugar"),sodium:val("sodium")};
+  }
+
+  function logFood(){
+    const food=coreFood();
+    const amountInput=document.getElementById("servingAmount"),unitInput=document.getElementById("servingUnit");
+    const amount=Number(amountInput?.value),unit=unitInput?.value||food?.defaultUnit||food?.nutritionUnit||"g";
+    if(!food){window.toast?.("Open a food first, then log it.");return;}
+    if(!Number.isFinite(amount)||amount<=0){amountInput?.focus();window.toast?.("Enter a valid amount");return;}
+    const calc=calculate(food,amount,unit);
+    if(!calc||!["cal","p","c","f","fiber"].every(k=>Number.isFinite(Number(calc[k])))){window.toast?.("Nutrition calculation failed");return;}
+    const state=window.state||{}; state.foodLog=Array.isArray(state.foodLog)?state.foodLog:[];
+    state.foodLog.push({id:"food_"+Date.now()+"_"+Math.random().toString(36).slice(2),name:food.name,amount,unit,cal:Number(calc.cal),p:Number(calc.p),c:Number(calc.c),f:Number(calc.f),fiber:Number(calc.fiber),sugar:Number(calc.sugar||0),sodium:Number(calc.sodium||0),date:window.today?.()||new Date().toISOString().slice(0,10),source:food.source||"MacroForge",barcode:food.barcode||""});
+    window.state=state; window.save?.(); window.modal?.("foodModal",false); window.updateDashboard?.(); renderLoggedFoods(); window.toast?.(`${food.name} logged`); window.go?.("dashboard");
+  }
+
+  function renderLoggedFoods(){
+    const box=document.getElementById("foodLogEntries"); if(!box)return;
+    const today=window.today?.()||new Date().toISOString().slice(0,10),items=(window.state?.foodLog||[]).filter(x=>x.date===today).slice().reverse();
+    box.innerHTML=items.length?items.map((x,i)=>`<div class="history-item"><div><b>${esc(x.name)}</b><small>${x.amount} ${esc(x.unit)} · ${Math.round(Number(x.cal)||0)} kcal · P ${Number(x.p||0).toFixed(1)}g · C ${Number(x.c||0).toFixed(1)}g · F ${Number(x.f||0).toFixed(1)}g</small></div><button class="text-btn" data-del-food="${i}">Delete</button></div>`).join(""):"<div class='muted'>Nothing logged today.</div>";
+    box.querySelectorAll("[data-del-food]").forEach(b=>b.onclick=()=>{const arr=(window.state.foodLog||[]).filter(x=>x.date===today).slice().reverse(),item=arr[Number(b.dataset.delFood)],idx=window.state.foodLog.indexOf(item);if(idx>-1){window.state.foodLog.splice(idx,1);window.save?.();window.updateDashboard?.();renderLoggedFoods();}});
+  }
+
+  function signOut(){
+    try{window.MacroForgeAuth?.signOut?.();}catch(e){localStorage.removeItem("macroforge_session_v1");location.href="auth.html";}
+    setTimeout(()=>{if(localStorage.getItem("macroforge_session_v1"))localStorage.removeItem("macroforge_session_v1");location.href="auth.html";},100);
+  }
+  function installSettings(){
+    const p=window.state?.profile||{};
+    const set=(id,v)=>{const e=document.getElementById(id);if(e)e.value=v??""};
+    set("profileName",p.name);set("profileAge",p.age);set("profileHeight",p.height);set("profileWeight",p.weight);set("profileActivity",p.activity||"moderate");set("unitSystem",p.unitSystem||"metric");
+    const saveBtn=document.getElementById("saveProfile");if(saveBtn)saveBtn.onclick=()=>{window.state.profile={name:document.getElementById("profileName")?.value.trim()||"",age:Number(document.getElementById("profileAge")?.value)||0,height:Number(document.getElementById("profileHeight")?.value)||0,weight:Number(document.getElementById("profileWeight")?.value)||0,activity:document.getElementById("profileActivity")?.value||"moderate",unitSystem:document.getElementById("unitSystem")?.value||"metric"};window.save?.();window.toast?.("Profile saved");};
+    const ex=document.getElementById("exportData");if(ex)ex.onclick=()=>window.mfExportData?.();
+    const imp=document.getElementById("importDataBtn");if(imp)imp.onclick=()=>document.getElementById("importData")?.click();
+    const inp=document.getElementById("importData");if(inp)inp.onchange=e=>window.mfImportData?.(e.target.files?.[0]);
+    const clr=document.getElementById("clearData");if(clr)clr.onclick=()=>window.mfClearAllData?.();
+    const session=window.MacroForgeAuth?.user||null;
+    const uname=document.getElementById("settingsUsername"); if(uname)uname.textContent=session?.username?`@${session.username}`:"Local account";
+    const unameInput=document.getElementById("settingsUsernameInput"); if(unameInput)unameInput.value=session?.username||"";
+    const accountBtn=document.getElementById("settingsAccount"); const details=document.getElementById("settingsAccountDetails");
+    if(accountBtn&&details){accountBtn.onclick=()=>{details.hidden=!details.hidden;accountBtn.textContent=details.hidden?"Account details":"Hide account details";};}
+    const goalsBtn=document.getElementById("settingsGoals");
+    if(goalsBtn)goalsBtn.onclick=()=>{const ids=[["goalCal",window.state.goals.cal],["goalProtein",window.state.goals.protein],["goalCarbs",window.state.goals.carbs],["goalFat",window.state.goals.fat],["goalWater",window.state.goals.water]];ids.forEach(([id,v])=>{const e=document.getElementById(id);if(e)e.value=v});window.modal?.("profileModal");};
+  }
+
+  function bind(){
+    installSearch(); installCustom(); installCustomGlobalLookup(); installSettings();
+    ["confirmFood","topSignOutButton","signOutButton"].forEach(id=>{const el=document.getElementById(id);if(!el)return;const fresh=el.cloneNode(true);el.replaceWith(fresh);if(id==="confirmFood")fresh.onclick=logFood;else fresh.onclick=signOut;});
+    const amount=document.getElementById("servingAmount"),unit=document.getElementById("servingUnit");
+    amount?.addEventListener("input",()=>window.mfUpdateFoodNutritionPreview?.());
+    unit?.addEventListener("change",()=>window.mfUpdateFoodNutritionPreview?.());
+    renderLoggedFoods(); window.mfUpdateInsights?.();
+  }
+
+  window.mfSearchGlobal=globalSearch; window.searchGlobal=globalSearch; window.mfLogSelectedFood=logFood;
+  document.addEventListener("DOMContentLoaded",()=>setTimeout(bind,80));
+})();
